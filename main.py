@@ -1,21 +1,26 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 from typing import Dict, List
 import logging
+import os
 
 # 配置日誌
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FinTech Monitor API", version="1.0.0")
+app = FastAPI(
+    title="FinTech Monitor API",
+    version="1.0.0",
+    description="金融市場監控 API"
+)
 
-# 配置 CORS
+# 配置 CORS - 允許所有來源
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生產環境請改為具體域名
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,84 +28,81 @@ app.add_middleware(
 
 # 數據代號配置
 TICKERS = {
-    "us10y": "^TNX",      # 美國 10年期國債
-    "jpy_fx": "JPY=X",    # 美日匯率
-    "gold": "GC=F",       # 黃金期貨
-    "oil": "CL=F"         # WTI 原油期貨
+    "us10y": "^TNX",
+    "jpy_fx": "JPY=X",
+    "gold": "GC=F",
+    "oil": "CL=F"
 }
 
-def fetch_bond_yield(ticker: str, period: str = "5d") -> pd.DataFrame:
-    """抓取債券收益率數據"""
+def fetch_ticker_data(ticker: str, period: str = "5d") -> pd.DataFrame:
+    """抓取 ticker 數據"""
     try:
+        logger.info(f"Fetching {ticker} data for period {period}")
         data = yf.Ticker(ticker)
         hist = data.history(period=period)
+        
         if hist.empty:
+            logger.warning(f"No data returned for {ticker}")
             raise ValueError(f"No data for {ticker}")
+        
+        logger.info(f"Successfully fetched {len(hist)} records for {ticker}")
         return hist
     except Exception as e:
         logger.error(f"Error fetching {ticker}: {str(e)}")
         raise
 
-def calculate_spread(us_data: pd.DataFrame, jp_data: pd.DataFrame) -> List[Dict]:
-    """計算美日利差"""
-    try:
-        # 對齊日期索引
-        common_dates = us_data.index.intersection(jp_data.index)
-        
-        spread_data = []
-        for date in common_dates:
-            us_yield = us_data.loc[date, 'Close']
-            # 日債收益率需要特殊處理（通常以百分比形式）
-            jp_yield = jp_data.loc[date, 'Close']
-            
-            spread_data.append({
-                "date": date.strftime("%Y-%m-%d %H:%M:%S"),
-                "us10y": round(float(us_yield), 4),
-                "jp10y": round(float(jp_yield), 4),
-                "spread": round(float(us_yield - jp_yield), 4)
-            })
-        
-        return sorted(spread_data, key=lambda x: x['date'])
-    except Exception as e:
-        logger.error(f"Error calculating spread: {str(e)}")
-        raise
-
 @app.get("/")
 async def root():
+    """根路徑 - API 資訊"""
     return {
         "message": "FinTech Monitor API",
         "version": "1.0.0",
-        "endpoints": ["/api/bond-spread", "/api/fx", "/api/commodities", "/api/all"]
+        "status": "running",
+        "endpoints": {
+            "root": "/",
+            "health": "/health",
+            "bond_spread": "/api/bond-spread",
+            "fx": "/api/fx",
+            "commodities": "/api/commodities",
+            "all": "/api/all"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """健康檢查"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/bond-spread")
 async def get_bond_spread(period: str = "5d"):
-    """
-    獲取美日利差數據
-    
-    Parameters:
-    - period: 數據週期 (1d, 5d, 1mo, 3mo, 6mo, 1y)
-    """
+    """獲取美日利差數據"""
     try:
+        logger.info(f"API /api/bond-spread called with period={period}")
+        
         # 抓取美債數據
-        us_data = fetch_bond_yield(TICKERS["us10y"], period)
+        us_data = fetch_ticker_data(TICKERS["us10y"], period)
         
-        # 日債數據（yfinance 可能沒有，提供備用方案）
-        try:
-            jp_ticker = yf.Ticker("^TNX")  # 暫時用美債模擬，實際需要其他數據源
-            jp_data = jp_ticker.history(period=period)
-            # 模擬日債收益率（實際應該從其他 API 獲取）
-            jp_data['Close'] = jp_data['Close'] * 0.02  # 假設日債約為美債的 2%
-        except:
-            # 如果無法獲取，使用固定值模擬
-            jp_data = us_data.copy()
-            jp_data['Close'] = 0.5  # 假設日債固定在 0.5%
+        # 日債使用固定值（yfinance 沒有準確的日債數據）
+        jp_yield = 1.0
         
-        spread_data = calculate_spread(us_data, jp_data)
+        spread_data = []
+        for date, row in us_data.iterrows():
+            us_yield = float(row['Close'])
+            spread_data.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "us10y": round(us_yield, 4),
+                "jp10y": round(jp_yield, 4),
+                "spread": round(us_yield - jp_yield, 4)
+            })
+        
+        logger.info(f"Successfully calculated {len(spread_data)} spread records")
         
         return {
             "success": True,
-            "data": spread_data,
+            "data": sorted(spread_data, key=lambda x: x['date']),
             "metadata": {
                 "period": period,
                 "data_points": len(spread_data),
@@ -113,27 +115,22 @@ async def get_bond_spread(period: str = "5d"):
 
 @app.get("/api/fx")
 async def get_fx_rate(period: str = "5d"):
-    """
-    獲取美日匯率數據
-    
-    Parameters:
-    - period: 數據週期
-    """
+    """獲取美日匯率數據"""
     try:
-        ticker = yf.Ticker(TICKERS["jpy_fx"])
-        hist = ticker.history(period=period)
+        logger.info(f"API /api/fx called with period={period}")
         
-        if hist.empty:
-            raise ValueError("No FX data available")
+        hist = fetch_ticker_data(TICKERS["jpy_fx"], period)
         
         fx_data = []
         for date, row in hist.iterrows():
             fx_data.append({
-                "date": date.strftime("%Y-%m-%d %H:%M:%S"),
+                "date": date.strftime("%Y-%m-%d"),
                 "rate": round(float(row['Close']), 4),
                 "high": round(float(row['High']), 4),
                 "low": round(float(row['Low']), 4)
             })
+        
+        logger.info(f"Successfully fetched {len(fx_data)} FX records")
         
         return {
             "success": True,
@@ -150,29 +147,43 @@ async def get_fx_rate(period: str = "5d"):
 
 @app.get("/api/commodities")
 async def get_commodities(period: str = "5d"):
-    """
-    獲取大宗商品數據（黃金、原油）
-    
-    Parameters:
-    - period: 數據週期
-    """
+    """獲取大宗商品數據"""
     try:
+        logger.info(f"API /api/commodities called with period={period}")
+        
         commodities = {}
         
-        for name, ticker_symbol in [("gold", "gold"), ("oil", "oil")]:
-            ticker = yf.Ticker(TICKERS[ticker_symbol])
-            hist = ticker.history(period=period)
-            
-            if not hist.empty:
-                data = []
-                for date, row in hist.iterrows():
-                    data.append({
-                        "date": date.strftime("%Y-%m-%d %H:%M:%S"),
-                        "price": round(float(row['Close']), 2),
-                        "change": round(float(row['Close'] - row['Open']), 2)
-                    })
-                
-                commodities[name] = sorted(data, key=lambda x: x['date'])
+        # 黃金
+        try:
+            gold_hist = fetch_ticker_data(TICKERS["gold"], period)
+            gold_data = []
+            for date, row in gold_hist.iterrows():
+                gold_data.append({
+                    "date": date.strftime("%Y-%m-%d"),
+                    "price": round(float(row['Close']), 2),
+                    "change": round(float(row['Close'] - row['Open']), 2)
+                })
+            commodities["gold"] = sorted(gold_data, key=lambda x: x['date'])
+            logger.info(f"Successfully fetched {len(gold_data)} gold records")
+        except Exception as e:
+            logger.error(f"Gold data error: {str(e)}")
+            commodities["gold"] = []
+        
+        # 原油
+        try:
+            oil_hist = fetch_ticker_data(TICKERS["oil"], period)
+            oil_data = []
+            for date, row in oil_hist.iterrows():
+                oil_data.append({
+                    "date": date.strftime("%Y-%m-%d"),
+                    "price": round(float(row['Close']), 2),
+                    "change": round(float(row['Close'] - row['Open']), 2)
+                })
+            commodities["oil"] = sorted(oil_data, key=lambda x: x['date'])
+            logger.info(f"Successfully fetched {len(oil_data)} oil records")
+        except Exception as e:
+            logger.error(f"Oil data error: {str(e)}")
+            commodities["oil"] = []
         
         return {
             "success": True,
@@ -188,23 +199,21 @@ async def get_commodities(period: str = "5d"):
 
 @app.get("/api/all")
 async def get_all_data(period: str = "5d"):
-    """
-    一次性獲取所有數據
-    
-    Parameters:
-    - period: 數據週期
-    """
+    """一次性獲取所有數據"""
     try:
-        bond_spread = await get_bond_spread(period)
-        fx = await get_fx_rate(period)
-        commodities = await get_commodities(period)
+        logger.info(f"API /api/all called with period={period}")
+        
+        # 分別獲取各項數據
+        bond_spread_result = await get_bond_spread(period)
+        fx_result = await get_fx_rate(period)
+        commodities_result = await get_commodities(period)
         
         return {
             "success": True,
             "data": {
-                "bondSpread": bond_spread["data"],
-                "fx": fx["data"],
-                "commodities": commodities["data"]
+                "bondSpread": bond_spread_result["data"],
+                "fx": fx_result["data"],
+                "commodities": commodities_result["data"]
             },
             "metadata": {
                 "period": period,
@@ -217,4 +226,5 @@ async def get_all_data(period: str = "5d"):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
